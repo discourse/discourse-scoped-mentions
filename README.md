@@ -4,23 +4,18 @@ Limit individual `@mention` autocomplete suggestions in private categories to us
 
 ## Setup
 
-This initial version requires the accompanying Discourse core extension in
-[`patches/discourse-user-search-scope.patch`](patches/discourse-user-search-scope.patch).
-Apply it to your Discourse checkout before loading the plugin:
+Requires Discourse core support for the `user_search_scoped_users` modifier and composer
+mention requests marked with `search_context=mention`. Both are prerequisites for filtering
+suggestions.
+
+Install the plugin in your Discourse checkout:
 
 ```sh
-git apply --check /path/to/discourse-scoped-mentions/patches/discourse-user-search-scope.patch
-git apply /path/to/discourse-scoped-mentions/patches/discourse-user-search-scope.patch
 ln -s /path/to/discourse-scoped-mentions plugins/discourse-scoped-mentions
 ```
 
 Restart Discourse, then enable **scoped mentions enabled** in Admin > Site settings.
 The setting is disabled by default and applies to every private category when enabled.
-
-The core extension is a prerequisite, not an optional optimization. Unpatched Discourse
-does not send the mention search context or call the plugin's search modifier.
-The bundled patch was prepared against core commit
-`802125b979b5bb848a7cfc52409ef3176ffd4d82` and includes its regression tests.
 
 ## Behavior
 
@@ -66,7 +61,7 @@ The implementation follows these bundled-plugin patterns:
 - [Reactions](https://github.com/discourse/discourse/blob/main/plugins/discourse-reactions/plugin.rb) registers query modifiers in `after_initialize`. The modifier registry checks the plugin's enabled setting on every call, so no second setting check is needed inside the filter.
 - [Assign](https://github.com/discourse/discourse/blob/main/plugins/discourse-assign/lib/discourse_assign/assignment_permissions.rb) uses a `GroupUser` subquery to select eligible users. This plugin also keeps both membership and administrator branches on the incoming user relation, preserving core eligibility restrictions.
 
-Run the plugin tests from the patched Discourse checkout:
+Run the plugin tests from a Discourse checkout with the required core support:
 
 ```sh
 LOAD_PLUGINS=1 bin/rspec plugins/discourse-scoped-mentions/spec/requests/users_controller_spec.rb
@@ -76,5 +71,5 @@ bin/rspec spec/requests/users_controller_spec.rb -e '#search_users'
 bin/qunit --standalone frontend/discourse/tests/unit/lib/user-search-test.js frontend/discourse/tests/integration/ui-kit/d-editor-mentions-test.gjs
 ```
 
-Run `bin/lint --fix` from Discourse against the changed core and plugin files before
+Run `bin/lint --fix` from Discourse against the changed plugin files before
 committing. No database migrations or plugin frontend assets are required.
