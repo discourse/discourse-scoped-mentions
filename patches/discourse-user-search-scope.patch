@@ -1,0 +1,290 @@
+diff --git a/app/controllers/users_controller.rb b/app/controllers/users_controller.rb
+index d6d439f5300..680fa9126c2 100644
+--- a/app/controllers/users_controller.rb
++++ b/app/controllers/users_controller.rb
+@@ -1324,6 +1324,7 @@ class UsersController < ApplicationController
+       topic_allowed_users: topic_allowed_users,
+       searching_user: current_user,
+       groups: @groups,
++      search_context: params[:search_context],
+     }
+ 
+     options[:include_staged_users] = !!ActiveModel::Type::Boolean.new.cast(
+diff --git a/app/models/user_search.rb b/app/models/user_search.rb
+index 619f934d09a..dd16cc2c6f0 100644
+--- a/app/models/user_search.rb
++++ b/app/models/user_search.rb
+@@ -24,6 +24,7 @@ class UserSearch
+     @user_ids = opts[:user_ids]
+     @can_review = opts[:can_review] || false
+     @search_custom_fields = opts[:search_custom_fields] || false
++    @search_context = opts[:search_context]
+ 
+     @topic = Topic.find(@topic_id) if @topic_id
+     @category = Category.find(@category_id) if @category_id
+@@ -66,7 +67,11 @@ class UserSearch
+           .where("users.admin OR categories.id = ?", @topic.category_id)
+     end
+ 
+-    users
++    DiscoursePluginRegistry.apply_modifier(
++      :user_search_scoped_users,
++      users,
++      { search_context: @search_context, category: @category, topic: @topic, guardian: @guardian },
++    )
+   end
+ 
+   def filtered_by_term_users
+diff --git a/frontend/discourse/app/lib/user-search.js b/frontend/discourse/app/lib/user-search.js
+index 7eb41001bf4..d1fd980b1a0 100644
+--- a/frontend/discourse/app/lib/user-search.js
++++ b/frontend/discourse/app/lib/user-search.js
+@@ -304,6 +304,7 @@ export default function userSearch(options) {
+   const limit = options.limit || 6;
+   const url = options.url || userPath("search/users");
+   const params = {
++    search_context: options.searchContext,
+     topic_id: options.topicId,
+     category_id: options.categoryId,
+     include_groups: options.includeGroups,
+diff --git a/frontend/discourse/app/ui-kit/d-editor.gjs b/frontend/discourse/app/ui-kit/d-editor.gjs
+index b4d2a24415f..36c024ce8fd 100644
+--- a/frontend/discourse/app/ui-kit/d-editor.gjs
++++ b/frontend/discourse/app/ui-kit/d-editor.gjs
+@@ -719,6 +719,7 @@ export default class DEditor extends Component {
+         destroyUserStatuses();
+         return userSearch({
+           term,
++          searchContext: "mention",
+           topicId: this.topicId,
+           categoryId: this.categoryId,
+           includeGroups: true,
+diff --git a/frontend/discourse/tests/unit/lib/user-search-test.js b/frontend/discourse/tests/unit/lib/user-search-test.js
+index 105b823514b..0bbaa4b1684 100644
+--- a/frontend/discourse/tests/unit/lib/user-search-test.js
++++ b/frontend/discourse/tests/unit/lib/user-search-test.js
+@@ -102,6 +102,43 @@ module("Unit | Utility | user-search", function (hooks) {
+     assert.strictEqual(results.length, 1);
+   });
+ 
++  test("it keeps mention search results separate from other search contexts", async function (assert) {
++    const contexts = [];
++    pretender.get("/u/search/users", (request) => {
++      const context = request.queryParams.search_context;
++      contexts.push(context);
++      return response({
++        users: [{ username: context === "mention" ? "mention_user" : "user" }],
++      });
++    });
++
++    let results = await userSearch({ term: "user" });
++    assert.strictEqual(
++      results[0].username,
++      "user",
++      "an ordinary search uses the default context"
++    );
++
++    results = await userSearch({ term: "user", searchContext: "mention" });
++    assert.strictEqual(
++      results[0].username,
++      "mention_user",
++      "mention searches do not reuse ordinary search results"
++    );
++
++    results = await userSearch({ term: "user", searchContext: "mention" });
++    assert.strictEqual(
++      results[0].username,
++      "mention_user",
++      "results are cached within the mention context"
++    );
++    assert.deepEqual(
++      contexts,
++      [undefined, "mention"],
++      "only mention searches send the mention context"
++    );
++  });
++
+   test("it searches the given url without reusing results cached for another one", async function (assert) {
+     pretender.get("/custom/search", () =>
+       response({ users: [{ username: "custom_user" }] })
+diff --git a/spec/models/user_search_spec.rb b/spec/models/user_search_spec.rb
+index 335f7e6052c..3dec4e6e90c 100644
+--- a/spec/models/user_search_spec.rb
++++ b/spec/models/user_search_spec.rb
+@@ -36,6 +36,91 @@ RSpec.describe UserSearch do
+     UserSearch.new(*args).search.map(&:username)
+   end
+ 
++  describe "#search with a scoped users modifier" do
++    let(:plugin_instance) { Plugin::Instance.new }
++    let(:modifier) { ->(users, _context) { users.where(id: [mr_blue.id, mr_brown.id]) } }
++
++    before { plugin_instance.register_modifier(:user_search_scoped_users, &modifier) }
++
++    after do
++      DiscoursePluginRegistry.unregister_modifier(
++        plugin_instance,
++        :user_search_scoped_users,
++        &modifier
++      )
++    end
++
++    it "filters exact and partial matches before applying the result limit" do
++      expect(search_for("mrb", limit: 2)).to contain_exactly(mr_blue.username, mr_brown.username)
++    end
++
++    it "filters topic participants before applying the result limit" do
++      Fabricate(:post, topic: topic, user: mr_b)
++      Fabricate(:post, topic: topic, user: mr_blue)
++
++      expect(search_for("", topic_id: topic.id, limit: 1)).to eq([mr_blue.username])
++    end
++  end
++
++  describe "#search modifier context" do
++    fab!(:searching_user, :user)
++    fab!(:selected_category, :category)
++
++    it "passes the selected category, topic, guardian, and search context" do
++      plugin_instance = Plugin::Instance.new
++      contexts = []
++      modifier = ->(users, context) do
++        contexts << context
++        users
++      end
++      plugin_instance.register_modifier(:user_search_scoped_users, &modifier)
++
++      search_for(
++        "mrb",
++        topic_id: topic.id,
++        category_id: selected_category.id,
++        searching_user: searching_user,
++        search_context: "mention",
++      )
++
++      expect(contexts).to be_present
++      contexts.each do |context|
++        expect(context.except(:guardian)).to eq(
++          category: selected_category,
++          topic: topic,
++          search_context: "mention",
++        )
++        expect(context[:guardian].user).to eq(searching_user)
++      end
++    ensure
++      DiscoursePluginRegistry.unregister_modifier(
++        plugin_instance,
++        :user_search_scoped_users,
++        &modifier
++      )
++    end
++
++    it "leaves the category unset when only a topic is supplied" do
++      plugin_instance = Plugin::Instance.new
++      categories = []
++      modifier = ->(users, context) do
++        categories << context[:category]
++        users
++      end
++      plugin_instance.register_modifier(:user_search_scoped_users, &modifier)
++
++      search_for("mrb", topic_id: topic.id)
++
++      expect(categories.uniq).to eq([nil])
++    ensure
++      DiscoursePluginRegistry.unregister_modifier(
++        plugin_instance,
++        :user_search_scoped_users,
++        &modifier
++      )
++    end
++  end
++
+   context "with a secure category" do
+     fab!(:user)
+     fab!(:searching_user, :user)
+diff --git a/frontend/discourse/tests/integration/ui-kit/d-editor-mentions-test.gjs b/frontend/discourse/tests/integration/ui-kit/d-editor-mentions-test.gjs
+new file mode 100644
+index 00000000000..3714a633490
+--- /dev/null
++++ b/frontend/discourse/tests/integration/ui-kit/d-editor-mentions-test.gjs
+@@ -0,0 +1,79 @@
++import { render, triggerKeyEvent } from "@ember/test-helpers";
++import { module, test } from "qunit";
++import DMenus from "discourse/float-kit/components/d-menus";
++import { USER_OPTION_COMPOSITION_MODES } from "discourse/lib/constants";
++import { setupRenderingTest } from "discourse/tests/helpers/component-test";
++import pretender, { response } from "discourse/tests/helpers/create-pretender";
++import DEditor from "discourse/ui-kit/d-editor";
++
++module("Integration | Component | DEditor", function (hooks) {
++  setupRenderingTest(hooks);
++
++  for (const [modeName, mode] of Object.entries(
++    USER_OPTION_COMPOSITION_MODES
++  )) {
++    for (const topicId of [undefined, 42]) {
++      test(`${modeName} mention requests include their context ${topicId ? "in existing topics" : "before a topic is saved"}`, async function (assert) {
++        this.siteSettings.enable_mentions = true;
++
++        const requests = [];
++        let textManipulation;
++        const onSetup = (instance) => {
++          textManipulation = instance;
++        };
++
++        pretender.get("/u/search/users", (request) => {
++          requests.push(request.queryParams);
++          return response({
++            users: [
++              { username: `user_category_${request.queryParams.category_id}` },
++            ],
++          });
++        });
++
++        await render(
++          <template>
++            <DEditor
++              @categoryId={{1}}
++              @forceEditorMode={{mode}}
++              @onSetup={{onSetup}}
++              @processPreview={{false}}
++              @topicId={{topicId}}
++            />
++            <DMenus />
++          </template>
++        );
++
++        if (mode === USER_OPTION_COMPOSITION_MODES.rich) {
++          const { view } = textManipulation;
++          view.dispatch(view.state.tr.insertText("@u"));
++          view.focus();
++        } else {
++          textManipulation.insertText("@u");
++        }
++        await triggerKeyEvent(".d-editor-input", "keyup", "U");
++
++        assert.strictEqual(
++          requests.length,
++          1,
++          "typing a mention searches users"
++        );
++        assert.strictEqual(
++          requests[0].category_id,
++          "1",
++          "the request uses the selected category"
++        );
++        assert.strictEqual(
++          requests[0].search_context,
++          "mention",
++          "the request identifies a mention search"
++        );
++        assert.strictEqual(
++          requests[0].topic_id,
++          topicId?.toString(),
++          "the request preserves the existing topic context"
++        );
++      });
++    }
++  }
++});

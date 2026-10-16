@@ -1,0 +1,3 @@
+en:
+  site_settings:
+    scoped_mentions_enabled: "Limit individual @mention suggestions in private categories to users who can read the category. This affects autocomplete suggestions only."
